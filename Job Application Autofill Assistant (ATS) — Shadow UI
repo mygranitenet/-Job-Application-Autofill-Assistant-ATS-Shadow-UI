@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Application Autofill Assistant (ATS) — Shadow UI
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  Scan ATS forms, build a JSON plan with an LLM, preview, and autofill without submitting. Shadow DOM UI to avoid site CSS conflicts.
 // @author       You
 // @match        *://*/*
@@ -53,7 +53,7 @@
     })
   }
 
-  const STATE = { plan:null }
+  const STATE = { plan:null, snapshot:null, badgeText:'' }
 
   // ----------------------------
   // SHADOW DOM UI
@@ -89,14 +89,19 @@
           .row{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px }
           .btn{ background:#1f6feb; color:#fff; border:0; padding:8px 10px; border-radius:8px; cursor:pointer; font-size:12px }
           .btn.sec{ background:#333 }
+          .btn:disabled{ opacity:0.5; cursor:not-allowed }
           .kv{ display:grid; grid-template-columns:120px 1fr; gap:6px; margin:6px 0; font-size:12px; color:#bbb }
           .inp, select{ width:100%; padding:6px 8px; border-radius:6px; border:1px solid #333; background:#0f0f0f; color:#ddd; font-size:12px }
           .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; background:#0a0a0a; color:#e5e7eb; padding:8px; border-radius:8px; white-space:pre-wrap; word-break:break-word }
-        </style>
-        <div class="card">
-          <div class="hdr">
-            <div class="dot"></div>
-            <div class="title">ATS Autofill</div>
+          .summary{ margin:8px 0; padding:8px; border-radius:8px; border:1px solid #2a2a2a; background:#0d0d0d; color:#e5e7eb; font-size:12px; line-height:1.4 }
+          .summary[data-tone="warn"]{ border-color:#f7b731; background:#2a1f03; color:#fde68a }
+          .summary[data-tone="success"]{ border-color:#1f6feb; background:#041527; color:#c7ddff }
+          .summary[data-tone="info"]{ border-color:#2a2a2a; background:#0d0d0d }
+         </style>
+         <div class="card">
+           <div class="hdr">
+             <div class="dot"></div>
+             <div class="title">ATS Autofill</div>
             <div id="badge" class="badge">detecting…</div>
           </div>
           <div class="body">
@@ -109,6 +114,10 @@
             <div class="row">
               <button id="settings" class="btn sec">Settings</button>
               <button id="copy" class="btn sec">Copy Plan</button>
+            </div>
+            <div class="row">
+              <button id="smart" class="btn">Run Flow</button>
+              <button id="clear" class="btn sec">Reset</button>
             </div>
             <div class="kv">
               <div>Mode</div>
@@ -129,6 +138,7 @@
                 </select>
               </div>
             </div>
+            <div id="summary" class="summary" data-tone="info">Scan to generate a snapshot and plan summary.</div>
             <div id="log" class="mono">Ready</div>
             <div id="json" class="mono" style="margin-top:8px; display:none"></div>
           </div>
@@ -145,6 +155,8 @@
       root.getElementById('tailor').addEventListener('click', tailorOnly)
       root.getElementById('settings').addEventListener('click', openSettings)
       root.getElementById('copy').addEventListener('click', copyPlan)
+      root.getElementById('smart').addEventListener('click', smartRun)
+      root.getElementById('clear').addEventListener('click', clearState)
       root.getElementById('mode').addEventListener('change', e=>{ cfg.mode=e.target.value; GM_setValue('mode',cfg.mode) })
 
       document.addEventListener('keydown', e=>{
@@ -155,9 +167,63 @@
     return root
   }
 
-  function setBadge(t){ const root=ensureUI(); const el=root.getElementById('badge'); if(el) el.textContent=t }
+  function setBadge(t){ STATE.badgeText=t; const root=ensureUI(); const el=root.getElementById('badge'); if(el) el.textContent=t }
   function log(t){ const root=ensureUI(); const el=root.getElementById('log'); if(el) el.textContent = `[${new Date().toLocaleTimeString()}] ${t}` }
   function showJSON(o){ const root=ensureUI(); const el=root.getElementById('json'); el.style.display='block'; el.textContent = JSON.stringify(o,null,2) }
+  function clearJSON(){ const root=ensureUI(); const el=root.getElementById('json'); el.style.display='none'; el.textContent='' }
+  function setSummary(text, tone='info'){ const el=ensureUI().getElementById('summary'); if(el){ el.textContent=text; el.setAttribute('data-tone', tone) } }
+  function setBusy(isBusy){
+    const ids=['scan','plan','fill','tailor','settings','copy','smart','clear']
+    const root=ensureUI()
+    ids.forEach(id=>{ const el=root.getElementById(id); if(el){ el.disabled=isBusy } })
+  }
+  async function withBusy(label, fn){
+    const previous = STATE.badgeText
+    setBusy(true)
+    setBadge(label)
+    try{ return await fn() }
+    finally{ setBusy(false); setBadge(previous||'Ready') }
+  }
+  const summarizeSnapshot = snapshot => {
+    if(!snapshot) return 'No snapshot yet.'
+    const det = snapshot.siteMeta||{}
+    const parts = [
+      `Platform: ${det.detectedPlatform||'custom'}`,
+      `${snapshot.domSnapshot?.length||0} controls`,
+      `Mode: ${snapshot.mode}`
+    ]
+    if(snapshot.jobDescription) parts.push('Job description detected')
+    return parts.join(' • ')
+  }
+  const summarizePlan = plan => {
+    if(!plan) return 'No plan yet.'
+    const actions = plan.actions||[]
+    const warnings = plan.warnings||[]
+    const uploads = plan.uploads||[]
+    const subjectives = plan.subjectivePrompts||[]
+    const tailored = plan.tailoredContent||{}
+    const tailoredParts=[]
+    if(Array.isArray(tailored.resumeBullets)&&tailored.resumeBullets.length) tailoredParts.push(`${tailored.resumeBullets.length} tailored bullets`)
+    if(tailored.coverLetter) tailoredParts.push('cover letter draft')
+    const pieces = [
+      `${actions.length} actions`,
+      warnings.length ? `${warnings.length} warning${warnings.length>1?'s':''}` : 'no warnings',
+      uploads.length ? `${uploads.length} upload prompt${uploads.length>1?'s':''}` : 'no uploads',
+      subjectives.length ? `${subjectives.length} subjective question${subjectives.length>1?'s':''}` : 'no subjective questions'
+    ]
+    if(tailoredParts.length) pieces.push(tailoredParts.join(' + '))
+    const platform = plan.platform || 'custom'
+    return `Plan for ${platform}: ${pieces.join(' • ')}.`
+  }
+  function clearState(){
+    STATE.plan=null
+    STATE.snapshot=null
+    GM_setValue('lastPlan', null)
+    GM_setValue('lastSnapshot', null)
+    clearJSON()
+    setSummary('Cleared saved snapshot and plan. Ready to scan again.', 'info')
+    log('State cleared')
+  }
   function copyPlan(){ const root=ensureUI(); const el=root.getElementById('json'); const txt=el.textContent; if(!txt){ log('Nothing to copy'); return } navigator.clipboard.writeText(txt).then(()=>log('Copied')) }
 
   // ----------------------------
@@ -428,32 +494,56 @@
       preferences: cfg.preferences,
       mode: ensureUI().getElementById('mode').value
     }
+    STATE.snapshot = snapshot
     GM_setValue('lastSnapshot', snapshot)
     showJSON(snapshot)
+    setSummary(summarizeSnapshot(snapshot),'info')
     log(`Scanned ${snapshot.domSnapshot.length} controls`)
     return snapshot
   }
 
-  async function buildPlan(){
-    const snapshot = scanPage()
-    try{
-      const plan = await getPlanFromLLM(snapshot)
-      STATE.plan = plan
-      GM_setValue('lastPlan', plan)
-      showJSON(plan)
-      log('Plan ready')
-    }catch(e){ console.error(e); log(String(e.message||e)) }
+  async function buildPlan(skipBusy){
+    const run = async()=>{
+      const snapshot = scanPage()
+      try{
+        const plan = await getPlanFromLLM(snapshot)
+        STATE.plan = plan
+        GM_setValue('lastPlan', plan)
+        showJSON(plan)
+        const tone = plan.warnings?.length ? 'warn' : 'success'
+        setSummary(summarizePlan(plan), tone)
+        log('Plan ready')
+        return plan
+      }catch(e){ console.error(e); setSummary(`Planning failed: ${String(e.message||e)}`,'warn'); log(String(e.message||e)) }
+    }
+    return skipBusy ? run() : withBusy('Planning…', run)
   }
 
-  async function autofill(){
-    const plan = STATE.plan || GM_getValue('lastPlan',null)
-    if(!plan){ log('No plan yet. Click Plan first.'); return }
-    try{ log('Applying plan'); await applyPlan(plan); log('Autofill complete') }catch(e){ console.error(e); log(String(e.message||e)) }
+  async function autofill(skipBusy){
+    const run = async()=>{
+      const plan = STATE.plan || GM_getValue('lastPlan',null)
+      if(!plan){ setSummary('No plan yet. Click Plan first.','warn'); log('No plan yet. Click Plan first.'); return }
+      try{ log('Applying plan'); await applyPlan(plan); setSummary('Autofill complete. Review before submitting.','success'); log('Autofill complete') }
+      catch(e){ console.error(e); setSummary(`Autofill failed: ${String(e.message||e)}`,'warn'); log(String(e.message||e)) }
+    }
+    return skipBusy ? run() : withBusy('Autofilling…', run)
   }
 
   async function tailorOnly(){
-    const snapshot = scanPage(); snapshot.mode='autofillAndTailor'
-    try{ const plan = await getPlanFromLLM(snapshot); STATE.plan=plan; GM_setValue('lastPlan',plan); showJSON(plan); log('Tailored content generated') }catch(e){ console.error(e); log(String(e.message||e)) }
+    return withBusy('Tailoring…', async()=>{
+      const snapshot = scanPage(); snapshot.mode='autofillAndTailor'
+      try{ const plan = await getPlanFromLLM(snapshot); STATE.plan=plan; GM_setValue('lastPlan',plan); showJSON(plan); setSummary(summarizePlan(plan), plan.warnings?.length?'warn':'success'); log('Tailored content generated') }
+      catch(e){ console.error(e); setSummary(`Tailoring failed: ${String(e.message||e)}`,'warn'); log(String(e.message||e)) }
+    })
+  }
+
+  async function smartRun(){
+    const mode = ensureUI().getElementById('mode').value
+    await withBusy('Running…', async()=>{
+      await buildPlan(true)
+      if(mode==='planOnly'){ log('Plan ready. Review before autofilling.'); return }
+      await autofill(true)
+    })
   }
 
   // ----------------------------
@@ -462,6 +552,7 @@
   ensureUI()
   const det = getPlatform()
   setBadge(`${det.platform} ${Math.round(det.confidence*100)}%`)
+  setSummary(`Ready on ${det.platform} (${Math.round(det.confidence*100)}% confidence). Scan to capture controls.`, 'info')
   log('Loaded')
   new MutationObserver(()=>ensureUI()).observe(document.documentElement,{childList:true,subtree:true})
 
